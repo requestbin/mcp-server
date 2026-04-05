@@ -1,0 +1,49 @@
+{
+  "name": "@requestbin/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for RequestBin — test webhooks from Claude Code, Cursor, and Windsurf",
+  "license": "MIT",
+  "homepage": "https://github.com/requestbin/mcp-server",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/requestbin/mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/requestbin/mcp-server/issues"
+  },
+  "keywords": [
+    "mcp",
+    "requestbin",
+    "webhook",
+    "ai-agent",
+    "claude-code",
+    "cursor",
+    "windsurf",
+    "debugging"
+  ],
+  "main": "dist/index.js",
+  "bin": {
+    "requestbin-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
+}
