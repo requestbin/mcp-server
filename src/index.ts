@@ -22,6 +22,11 @@ import { RequestBinClient } from './api-client.js';
 
 const API_KEY = process.env.REQUESTBIN_API_KEY;
 const BASE_URL = process.env.REQUESTBIN_BASE_URL || 'https://requestbin.net';
+const MOCK_DOMAIN = process.env.REQUESTBIN_MOCK_DOMAIN || 'rbmock.dev';
+
+function mockUrl(slug: string): string {
+  return `https://${slug}.${MOCK_DOMAIN}`;
+}
 
 if (!API_KEY) {
   console.error('Error: REQUESTBIN_API_KEY environment variable is required.');
@@ -268,6 +273,143 @@ server.tool(
         content: [{
           type: 'text' as const,
           text: JSON.stringify(servers, null, 2),
+        }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: list_mock_endpoints ──
+
+server.tool(
+  'list_mock_endpoints',
+  'List your mock API endpoints (custom HTTP responses at {slug}.rbmock.dev). Useful for finding endpoint IDs and current rule counts.',
+  {},
+  async () => {
+    try {
+      const result = await client.listMockEndpoints();
+      const endpoints = (result.endpoints || []).map((e: any) => ({
+        id: e.id,
+        slug: e.slug,
+        name: e.name,
+        url: mockUrl(e.slug),
+        status: e.status,
+        configVersion: e.configVersion,
+        rules: e.rules?.length || 0,
+        interactionCount: e.interactionCount || 0,
+        publishedAt: e.publishedAt,
+      }));
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify(endpoints, null, 2),
+        }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: create_mock_endpoint ──
+
+server.tool(
+  'create_mock_endpoint',
+  'Create a mock API endpoint. Returns a live URL ({slug}.rbmock.dev) that responds to HTTP requests with rules you configure. A starter rule (any-method any-path → 200 JSON) is added automatically. Custom slugs require PRO/TEAM; otherwise an auto-slug is generated.',
+  {
+    name: z.string().optional().describe('Display name for the endpoint (e.g. "Stripe API mock", "Auth fixture")'),
+    slug: z.string().optional().describe('Custom subdomain slug (PRO/TEAM only). Leave empty for an auto-generated slug.'),
+  },
+  async ({ name, slug }) => {
+    try {
+      const result = await client.createMockEndpoint({ name, slug });
+      const ep = result.endpoint;
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            id: ep?.id,
+            slug: ep?.slug,
+            name: ep?.name,
+            url: ep?.slug ? mockUrl(ep.slug) : null,
+            status: ep?.status,
+            rules: ep?.rules?.length || 0,
+            message: ep?.slug
+              ? `Mock endpoint created. Hit it at: ${mockUrl(ep.slug)}`
+              : 'Mock endpoint created.',
+          }, null, 2),
+        }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: add_mock_rule ──
+
+server.tool(
+  'add_mock_rule',
+  'Append a routing rule to a mock endpoint. Rules are matched in priority order; the first match wins. After adding rules, call deploy_mock to publish them.',
+  {
+    endpointId: z.string().describe('The mock endpoint ID (from list_mock_endpoints / create_mock_endpoint)'),
+    method: z.enum(['*', 'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']).describe('HTTP method to match. Use "*" to match any method.'),
+    path: z.string().describe('Path to match (e.g. "/users", "/api/v1/*"). Use "*" to match any path.'),
+    statusCode: z.number().int().min(100).max(599).describe('HTTP status code to return (100–599)'),
+    body: z.string().optional().describe('Response body (string; for JSON, pass a serialized JSON string)'),
+    headers: z.record(z.string()).optional().describe('Response headers as a flat object (e.g. {"Content-Type": "application/json"})'),
+    priority: z.number().int().optional().describe('Higher priority rules are evaluated first (default 0)'),
+  },
+  async ({ endpointId, method, path, statusCode, body, headers, priority }) => {
+    try {
+      const result = await client.addMockRule(endpointId, {
+        match: { method, path },
+        response: { statusCode, headers: headers || {}, body: body || '' },
+        priority,
+      });
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            ruleId: result.rule?.id,
+            match: result.rule?.match,
+            response: { statusCode: result.rule?.response?.statusCode },
+            message: 'Rule added. Call deploy_mock to publish the change.',
+          }, null, 2),
+        }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── Tool: deploy_mock ──
+
+server.tool(
+  'deploy_mock',
+  'Publish the current rule set of a mock endpoint to the live mock server. Bumps the configVersion and invalidates edge caches so new requests see the latest rules.',
+  {
+    endpointId: z.string().describe('The mock endpoint ID to deploy'),
+  },
+  async ({ endpointId }) => {
+    try {
+      const result = await client.deployMockEndpoint(endpointId);
+      const ep = result.endpoint;
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            id: ep?.id,
+            slug: ep?.slug,
+            url: ep?.slug ? mockUrl(ep.slug) : null,
+            status: ep?.status,
+            configVersion: ep?.configVersion,
+            publishedAt: ep?.publishedAt,
+            message: `Deployed v${ep?.configVersion}. Live at ${ep?.slug ? mockUrl(ep.slug) : '(unknown slug)'}.`,
+          }, null, 2),
         }],
       };
     } catch (e: any) {

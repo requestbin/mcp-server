@@ -118,4 +118,45 @@ export class RequestBinClient {
   async listServers(): Promise<any> {
     return this.request('/api/servers');
   }
+
+  // ── Mock Endpoints ──
+
+  async listMockEndpoints(): Promise<any> {
+    return this.request('/api/mock-endpoints');
+  }
+
+  async createMockEndpoint(opts: {
+    name?: string;
+    slug?: string;
+  } = {}): Promise<any> {
+    const body: Record<string, unknown> = {};
+    if (opts.name !== undefined) {
+      body.name = opts.name;
+    }
+    if (opts.slug !== undefined && opts.slug !== '') {
+      body.slug = opts.slug;
+    }
+    return this.request('/api/mock-endpoints', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async addMockRule(endpointId: string, rule: {
+    match: { method: string; path: string };
+    response: { statusCode: number; headers?: Record<string, string>; body?: string };
+    priority?: number;
+    isActive?: boolean;
+  }): Promise<any> {
+    return this.request(`/api/mock-endpoints/${endpointId}/rules`, {
+      method: 'POST',
+      body: JSON.stringify(rule),
+    });
+  }
+
+  async deployMockEndpoint(endpointId: string): Promise<any> {
+    return this.request(`/api/mock-endpoints/${endpointId}/deploy`, {
+      method: 'POST',
+    });
+  }
 }
