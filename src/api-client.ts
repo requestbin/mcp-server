@@ -159,4 +159,9 @@ export class RequestBinClient {
       method: 'POST',
     });
   }
+
+  async listMockCaptures(endpointId: string, opts: { limit?: number } = {}): Promise<any> {
+    const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
+    return this.request(`/api/mock-endpoints/${endpointId}/interactions?limit=${limit}`);
+  }
 }

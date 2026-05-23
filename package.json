@@ -1,6 +1,6 @@
 {
   "name": "@requestbin/mcp-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for RequestBin — test webhooks from Claude Code, Cursor, and Windsurf",
   "license": "MIT",
   "homepage": "https://github.com/requestbin/mcp-server",

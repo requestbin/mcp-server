@@ -114,6 +114,7 @@ Add to `~/.windsurf/mcp_config.json`:
 | `create_mock_endpoint` | Create a mock endpoint (returns live `{slug}.rbmock.dev` URL) |
 | `add_mock_rule` | Append a routing rule (match method/path → status + headers + body) |
 | `deploy_mock` | Publish the current rule set so the live mock server picks it up |
+| `list_mock_captures` | List recent requests that hit a mock endpoint — verify your integration is actually calling the mock URL |
 
 ## Example Workflow
 
