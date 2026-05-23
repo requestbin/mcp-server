@@ -418,6 +418,43 @@ server.tool(
   },
 );
 
+// ── Tool: list_mock_captures ──
+
+server.tool(
+  'list_mock_captures',
+  'List recent captured requests that hit a mock endpoint. Use this to verify your integration is actually calling the mock URL — shows method, path, status, and time for each capture. Returns up to 50 by default.',
+  {
+    endpointId: z.string().describe('The mock endpoint ID (from list_mock_endpoints)'),
+    limit: z.number().int().min(1).max(200).optional().describe('Max captures to return (1-200, default 50)'),
+  },
+  async ({ endpointId, limit }) => {
+    try {
+      const result = await client.listMockCaptures(endpointId, { limit });
+      const captures = (result.interactions || []).map((i: any) => ({
+        id: i.id,
+        method: i.method,
+        path: i.path,
+        statusCode: i.statusCode,
+        matchedRuleId: i.matchedRuleId,
+        occurredAt: i.occurredAt,
+        remoteAddress: i.remoteAddress,
+      }));
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            count: captures.length,
+            total: result.total ?? captures.length,
+            captures,
+          }, null, 2),
+        }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
+    }
+  },
+);
+
 // ── Start server ──
 
 async function main() {
