@@ -2,25 +2,42 @@
  * RequestBin API client — used by MCP tools to interact with the API.
  */
 
+import { ApiError } from './errors.js';
+
+/** Network errors that prove the request never reached a server (safe to say "nothing was sent"). */
+const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
 export class RequestBinClient {
   private baseUrl: string;
   private apiKey: string;
+  private fetchImpl: FetchLike;
 
-  constructor(apiKey: string, baseUrl = 'https://requestbin.net') {
+  constructor(apiKey: string, baseUrl = 'https://requestbin.net', fetchImpl: FetchLike = fetch) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.fetchImpl = fetchImpl;
   }
 
   private async request(path: string, options: RequestInit = {}): Promise<any> {
     const url = `${this.baseUrl}${path}`;
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    });
+    const isWrite = (options.method ?? 'GET').toUpperCase() !== 'GET';
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        ...options,
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+    } catch (e: any) {
+      const code = e?.cause?.code ?? e?.code;
+      // The message is generated here (never from the request), so it cannot contain the Authorization header.
+      throw new ApiError(code ? String(code) : 'network failure', 0, null, isWrite && !NOT_SENT_CODES.has(code));
+    }
 
     const text = await res.text();
     let data: any;
@@ -31,7 +48,7 @@ export class RequestBinClient {
     }
 
     if (!res.ok) {
-      throw new Error(data.error || `API error: ${res.status} ${res.statusText}`);
+      throw new ApiError(data.error || `API error: ${res.status} ${res.statusText}`, res.status, data, isWrite && res.status >= 500);
     }
 
     return data;
@@ -142,11 +159,31 @@ export class RequestBinClient {
     });
   }
 
+  async getMockEndpoint(endpointId: string): Promise<any> {
+    return this.request(`/api/mock-endpoints/${encodeURIComponent(endpointId)}`);
+  }
+
+  /** PATCH one rule. `sequence` omitted = preserved, `null` = cleared; `expectedUpdatedAt` makes the write atomic (409 on conflict). */
+  async updateMockRule(endpointId: string, ruleId: string, patch: Record<string, unknown>): Promise<any> {
+    return this.request(`/api/mock-endpoints/${encodeURIComponent(endpointId)}/rules/${encodeURIComponent(ruleId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    });
+  }
+
+  /** 202 = reset QUEUED on the data plane (not proof it was consumed). 404 `Not found` = scenario runtime disabled. */
+  async resetMockSequence(endpointId: string, ruleId: string): Promise<any> {
+    return this.request(`/api/mock-endpoints/${encodeURIComponent(endpointId)}/rules/${encodeURIComponent(ruleId)}/reset`, {
+      method: 'POST',
+    });
+  }
+
   async addMockRule(endpointId: string, rule: {
     match: { method: string; path: string };
     response: { statusCode: number; headers?: Record<string, string>; body?: string };
     priority?: number;
     isActive?: boolean;
+    sequence?: unknown;
   }): Promise<any> {
     return this.request(`/api/mock-endpoints/${endpointId}/rules`, {
       method: 'POST',

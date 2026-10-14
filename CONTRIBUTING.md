@@ -28,7 +28,11 @@ Open an issue describing:
 ## Available tools
 
 `list_bins`, `create_bin`, `get_bin`, `delete_bin`,
-`list_interactions`, `replay_request`, `get_replay_status`, `list_servers`
+`list_interactions`, `replay_request`, `get_replay_status`, `list_servers`,
+`list_mock_endpoints`, `get_mock_endpoint`, `create_mock_endpoint`, `update_mock_rule`, `add_mock_rule`,
+`reset_mock_sequence`, `deploy_mock`, `list_mock_captures`
+
+Run `npm test` before opening a PR. Live demo scripts (local review stack only) are in `demo/`.
 
 ## Payload providers
 
