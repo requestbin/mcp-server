@@ -9,42 +9,74 @@ const NOT_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+export type ClientOptions = {
+  /** Bound for the WHOLE request including reading the body (default 30 s). An abort on a write is NOT proof the write did not happen. */
+  timeoutMs?: number;
+};
+
 export class RequestBinClient {
   private baseUrl: string;
   private apiKey: string;
   private fetchImpl: FetchLike;
+  private timeoutMs: number;
 
-  constructor(apiKey: string, baseUrl = 'https://requestbin.net', fetchImpl: FetchLike = fetch) {
+  constructor(apiKey: string, baseUrl = 'https://requestbin.net', fetchImpl: FetchLike = fetch, opts: ClientOptions = {}) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.fetchImpl = fetchImpl;
+    this.timeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 30000;
   }
 
+  /**
+   * One HTTP call. Everything after the request is sent is inside the same guard: a failure while reading or parsing
+   * the response of a WRITE keeps may-have-applied semantics (the server may have committed before the body broke).
+   */
   private async request(path: string, options: RequestInit = {}): Promise<any> {
     const url = `${this.baseUrl}${path}`;
     const isWrite = (options.method ?? 'GET').toUpperCase() !== 'GET';
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeoutMs);
     let res: Response;
+    let text: string;
     try {
-      res = await this.fetchImpl(url, {
-        ...options,
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-          ...options.headers,
-        },
-      });
-    } catch (e: any) {
-      const code = e?.cause?.code ?? e?.code;
-      // The message is generated here (never from the request), so it cannot contain the Authorization header.
-      throw new ApiError(code ? String(code) : 'network failure', 0, null, isWrite && !NOT_SENT_CODES.has(code));
+      try {
+        res = await this.fetchImpl(url, {
+          ...options,
+          signal: controller.signal,
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+            ...options.headers,
+          },
+        });
+      } catch (e: any) {
+        if (timedOut) {
+          throw new ApiError(`timed out after ${this.timeoutMs} ms`, 0, null, isWrite, 'timeout');
+        }
+        const code = e?.cause?.code ?? e?.code;
+        // The message is generated here (never from the request), so it cannot contain the Authorization header.
+        const refused = NOT_SENT_CODES.has(code);
+        throw new ApiError(code ? String(code) : 'network failure', 0, null, isWrite && !refused, refused ? 'refused' : 'transport');
+      }
+      try {
+        text = await res.text();
+      } catch (e: any) {
+        throw new ApiError(timedOut ? `timed out after ${this.timeoutMs} ms` : `response body could not be read (${e?.cause?.code ?? e?.name ?? 'error'})`, 0, null, isWrite, timedOut ? 'timeout' : 'unreadable');
+      }
+    } finally {
+      clearTimeout(timer);
     }
 
-    const text = await res.text();
     let data: any;
     try {
       data = JSON.parse(text);
     } catch {
-      data = { raw: text };
+      if (res.ok) {
+        // A 2xx we cannot parse (HTML gateway page, truncated stream): for a write this may hide a committed change.
+        throw new ApiError('success response was not valid JSON', 0, null, isWrite, 'unreadable');
+      }
+      data = { raw: text.slice(0, 500) };
     }
 
     if (!res.ok) {

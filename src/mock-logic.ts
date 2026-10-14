@@ -168,7 +168,89 @@ export function hasChange(patch: RulePatch): boolean {
   return patch.match !== undefined || patch.response !== undefined || patch.priority !== undefined || patch.isActive !== undefined || patch.sequence !== undefined;
 }
 
-/** Does an existing rule look like the one an add_mock_rule call tried to create? (used after an ambiguous write) */
-export function looksLikeCreated(rule: Rule, wanted: { method: string; path: string; statusCode: number; priority: number; body: string }): boolean {
-  return rule.match.method === wanted.method && rule.match.path === wanted.path && rule.response.statusCode === wanted.statusCode && rule.priority === wanted.priority && (rule.response.body ?? '') === wanted.body;
+export type RuleConfig = {
+  priority: number;
+  isActive: boolean;
+  match: { method: string; path: string };
+  response: { statusCode: number; headers: Record<string, string>; body: string };
+  sequence?: { steps: Array<{ statusCode: number; delayMs?: number; headers?: Record<string, string>; body?: string }>; afterLast?: string } | null;
+};
+
+function configKey(r: RuleConfig): string {
+  return JSON.stringify({
+    priority: r.priority,
+    isActive: r.isActive,
+    match: { method: r.match.method, path: r.match.path },
+    response: { statusCode: r.response.statusCode, headers: sortKeys(r.response.headers ?? {}), body: r.response.body ?? '' },
+    sequence: r.sequence?.steps?.length
+      ? { afterLast: r.sequence.afterLast ?? 'hold_last', steps: r.sequence.steps.map(s => ({ statusCode: s.statusCode, delayMs: s.delayMs ?? 0, headers: sortKeys(s.headers ?? {}), body: s.body ?? '' })) }
+      : null,
+  });
+}
+
+/** Full-configuration equality (priority, active flag, match, status, headers, body, sequence). Equality is still NOT proof of causality. */
+export function sameConfig(a: RuleConfig, b: RuleConfig): boolean {
+  return configKey(a) === configKey(b);
+}
+
+export type Candidate = { ruleId: string; matchesIntendedExactly: boolean; match: { method: string; path: string }; priority: number; statusCode: number; hasSequence: boolean };
+
+/**
+ * After an ambiguous add: rules that did not exist before our attempt and share the intended method+path (or equal it
+ * exactly). They are CANDIDATES only — a concurrent writer can create a look-alike, and our own request may still commit.
+ */
+export function candidatesAfterAdd(before: Rule[], after: Rule[], intended: RuleConfig): Candidate[] {
+  const known = new Set(before.map(r => r.id));
+  return after
+    .filter(r => !known.has(r.id))
+    .filter(r => sameConfig(r, intended) || (r.match.method === intended.match.method && r.match.path === intended.match.path))
+    .map(r => ({
+      ruleId: r.id,
+      matchesIntendedExactly: sameConfig(r, intended),
+      match: r.match,
+      priority: r.priority,
+      statusCode: r.response.statusCode,
+      hasSequence: Boolean(r.sequence?.steps?.length),
+    }));
+}
+
+export type ServerCapabilities = {
+  status: 'ok' | 'absent' | 'malformed';
+  contract?: string;
+  atomicCas: boolean;
+  scenarioSupported: boolean;
+  scenarioEnabled: boolean;
+  note: string;
+};
+
+const CONTRACT = 'mock-rules-v1';
+
+/**
+ * The ONLY accepted evidence of server capabilities is the explicit `capabilities` object the server's own build returns
+ * (SaaS src/libs/mock/capabilities.ts). Presence of updatedAt / publishedRules / publishIsolation, a version string or a
+ * URL is not evidence. Absent or malformed => every capability-dependent write is refused before sending.
+ */
+export function parseCapabilities(raw: unknown): ServerCapabilities {
+  const none = { atomicCas: false, scenarioSupported: false, scenarioEnabled: false };
+  if (raw === undefined || raw === null) {
+    return { status: 'absent', ...none, note: 'This server does not state its capabilities (an older build). Read-only tools work; edits that need atomic compare-and-set or Sequences are refused so nothing can be silently overwritten or dropped.' };
+  }
+  const c = raw as any;
+  const malformed = (why: string): ServerCapabilities => ({ status: 'malformed', ...none, note: `The server's capabilities object is not understood (${why}). Treated as unsupported: read-only tools work; capability-dependent edits are refused.` });
+  if (typeof c !== 'object' || c.apiContract !== CONTRACT) {
+    return malformed('unknown apiContract');
+  }
+  if (!c.ruleUpdate || typeof c.ruleUpdate !== 'object' || typeof c.ruleUpdate.atomicCas !== 'boolean') {
+    return malformed('ruleUpdate.atomicCas must be a boolean');
+  }
+  let scenarioSupported = false;
+  let scenarioEnabled = false;
+  if (c.scenario !== undefined) {
+    if (!c.scenario || typeof c.scenario !== 'object' || typeof c.scenario.supported !== 'boolean' || typeof c.scenario.enabled !== 'boolean') {
+      return malformed('scenario.supported/enabled must be booleans');
+    }
+    scenarioSupported = c.scenario.supported;
+    scenarioEnabled = c.scenario.supported && c.scenario.enabled;
+  }
+  return { status: 'ok', contract: CONTRACT, atomicCas: c.ruleUpdate.atomicCas, scenarioSupported, scenarioEnabled, note: 'Capabilities were stated by the server itself.' };
 }

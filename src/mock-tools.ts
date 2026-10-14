@@ -11,9 +11,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { RequestBinClient } from './api-client.js';
-import { ApiError, errorResult, toToolError } from './errors.js';
-import type { Rule, RulePatch } from './mock-logic.js';
-import { buildPatchPayload, hasChange, looksLikeCreated, MATCH_SEMANTICS, matchOrder, publishState, ruleWarnings, summarizeRule } from './mock-logic.js';
+import { ApiError, errorResult, serializeSafe, toolRefusal, toToolError } from './errors.js';
+import type { Rule, RuleConfig, RulePatch, ServerCapabilities } from './mock-logic.js';
+import { buildPatchPayload, candidatesAfterAdd, hasChange, MATCH_SEMANTICS, matchOrder, parseCapabilities, publishState, ruleWarnings, summarizeRule } from './mock-logic.js';
 
 export type MockToolsConfig = {
   apiKey?: string;
@@ -38,12 +38,33 @@ const sequenceSchema = z.object({
 
 export function registerMockTools(server: McpServer, client: RequestBinClient, cfg: MockToolsConfig) {
   const urlFor = (slug: string) => `${cfg.mockScheme}://${slug}.${cfg.mockDomain}`;
-  const ok = (payload: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }] });
-  const fail = (err: unknown, tool: string, intendedChange?: unknown) => errorResult(toToolError(err, { tool, intendedChange, apiKey: cfg.apiKey }));
+  // Every payload leaves through serializeSafe: the CONFIGURED credential is redacted at the output boundary only.
+  const ok = (payload: unknown) => ({ content: [{ type: 'text' as const, text: serializeSafe(payload, cfg.apiKey) }] });
+  const fail = (err: unknown, tool: string, intendedChange?: unknown) => errorResult(toToolError(err, { tool, intendedChange, apiKey: cfg.apiKey }), cfg.apiKey);
+  const refuse = (payload: ReturnType<typeof toolRefusal>) => errorResult(payload, cfg.apiKey);
+  /** A successful write response that lacks the fields we rely on may hide a committed change: treat as UNKNOWN. */
+  const requireShape = (cond: boolean, what: string) => {
+    if (!cond) {
+      throw new ApiError(`success response is missing ${what}`, 0, null, true, 'unreadable');
+    }
+  };
+  const capabilityRefusal = (caps: ServerCapabilities, needs: string, intended: unknown) => refuse(toolRefusal(
+    'capability_unavailable',
+    `Refused before sending anything: this server did not state support for ${needs} (capabilities: ${caps.status}). ${caps.note}`,
+    'Nothing was changed. Use a server build that states the capability (RequestBin API contract "mock-rules-v1"), or make the change in the web UI. This tool never infers capability from other fields and has no override.',
+    { intendedChange: intended, details: { serverCapabilities: caps } },
+  ));
+  const scenarioRefusal = (caps: ServerCapabilities, intended: unknown) => refuse(toolRefusal(
+    'scenario_runtime_unavailable',
+    'The Scenario runtime is not enabled on this server, so Sequences and Reset are unavailable. Nothing was sent.',
+    'This is a server capability gap. Use a static response, or ask a server operator to enable Scenario. This tool never enables flags.',
+    { intendedChange: intended, details: { serverCapabilities: caps } },
+  ));
 
-  const view = (ep: any) => {
+  const view = (ep: any, caps?: ServerCapabilities) => {
     const rules: Rule[] = ep.rules ?? [];
     return {
+      ...(caps ? { serverCapabilities: caps } : {}),
       id: ep.id,
       slug: ep.slug,
       name: ep.name,
@@ -97,6 +118,7 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
       try {
         const result = await client.createMockEndpoint({ name, slug });
         const ep = result.endpoint;
+        requireShape(typeof ep?.id === 'string' && Array.isArray(ep?.rules), 'endpoint.id / endpoint.rules');
         return ok({
           ...view(ep),
           message: `Created ${ep?.slug ? urlFor(ep.slug) : 'endpoint'} with a starter rule (id ${ep?.rules?.[0]?.id}). Next: update_mock_rule on that id (pass updatedAt), then deploy_mock.`,
@@ -115,7 +137,7 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
     async ({ endpointId }) => {
       try {
         const result = await client.getMockEndpoint(endpointId);
-        return ok(view(result.endpoint));
+        return ok(view(result.endpoint, parseCapabilities(result.capabilities)));
       } catch (e) {
         return fail(e, 'get_mock_endpoint');
       }
@@ -125,7 +147,7 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
   // ── add_mock_rule ──
   server.tool(
     'add_mock_rule',
-    `Append a rule to a mock endpoint (WRITE; saved but NOT deployed — call deploy_mock to publish). ${MATCH_SEMANTICS} A new rule is appended with the priority you give (default 0); a catch-all with an equal or lower priority number is evaluated first and will shadow it — the result lists such warnings. Plan caps apply per endpoint (Free 1 / PRO 5 / TEAM 20); a cap rejection is plan_limit and creates nothing. On Free use update_mock_rule on the starter instead. After a network failure or 5xx this tool does NOT retry; it checks the endpoint once and reports whether the rule now exists so you do not add a duplicate.`,
+    `Append a rule to a mock endpoint (WRITE; saved but NOT deployed — call deploy_mock to publish). ${MATCH_SEMANTICS} A new rule is appended with the priority you give (default 0); a catch-all with an equal or lower priority number is evaluated first and will shadow it — the result lists such warnings. Plan caps apply per endpoint (Free 1 / PRO 5 / TEAM 20); a cap rejection is plan_limit and creates nothing. On Free use update_mock_rule on the starter instead. A sequence requires a server that states Scenario support. After a lost response, timeout, unreadable response or 5xx the outcome is UNKNOWN: this tool never retries; it re-reads the endpoint once and lists CANDIDATE rules (not proof — a concurrent writer can create a look-alike and your request may still commit later). Do not repeat the add on that evidence.`,
     {
       endpointId: z.string().describe('Mock endpoint id'),
       method: z.enum(METHODS).describe('"*" = any method, or one exact method'),
@@ -138,42 +160,52 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
     },
     async ({ endpointId, method, path, statusCode, body, headers, priority, sequence }) => {
       const intended = { endpointId, method, path, statusCode, body, headers, priority, sequence };
-      let before: Rule[] | null = null;
+      let before: Rule[];
+      let caps: ServerCapabilities;
       try {
-        before = (await client.getMockEndpoint(endpointId)).endpoint?.rules ?? [];
+        const pre = await client.getMockEndpoint(endpointId);
+        before = pre.endpoint?.rules ?? [];
+        caps = parseCapabilities(pre.capabilities);
       } catch (e) {
         return fail(e, 'add_mock_rule', intended);
       }
+      if (sequence) {
+        // Older servers accept the call and silently drop `sequence`: refuse before sending.
+        if (!caps.scenarioSupported) {
+          return capabilityRefusal(caps, 'Scenario sequences', intended);
+        }
+        if (!caps.scenarioEnabled) {
+          return scenarioRefusal(caps, intended);
+        }
+      }
+      const wanted: RuleConfig = { priority: priority ?? 0, isActive: true, match: { method, path }, response: { statusCode, headers: headers || {}, body: body || '' }, ...(sequence ? { sequence } : {}) };
       try {
-        const result = await client.addMockRule(endpointId, {
-          match: { method, path },
-          response: { statusCode, headers: headers || {}, body: body || '' },
-          priority,
-          ...(sequence ? { sequence } : {}),
-        });
+        const result = await client.addMockRule(endpointId, { match: wanted.match, response: wanted.response, priority, ...(sequence ? { sequence } : {}) });
         const ep = result.endpoint;
+        requireShape(typeof result.rule?.id === 'string' && Array.isArray(ep?.rules) && typeof ep?.updatedAt === 'string', 'rule.id / endpoint.rules / endpoint.updatedAt');
         return ok({
-          rule: result.rule ? summarizeRule(result.rule) : null,
-          updatedAt: ep?.updatedAt,
-          warnings: ruleWarnings(ep?.rules ?? []),
+          rule: summarizeRule(result.rule),
+          updatedAt: ep.updatedAt,
+          warnings: ruleWarnings(ep.rules),
           deployed: false,
           message: 'Rule saved. Nothing is deployed yet — call deploy_mock to publish.',
         });
       } catch (e) {
         if (e instanceof ApiError && e.mayHaveApplied) {
-          // Ambiguous: look once, never write again.
+          // Outcome UNKNOWN. One read-only look for candidates; never a second write, never a verdict.
+          const payload = toToolError(e, { tool: 'add_mock_rule', intendedChange: intended, apiKey: cfg.apiKey });
           try {
-            const now = (await client.getMockEndpoint(endpointId)).endpoint?.rules ?? [];
-            const known = new Set((before ?? []).map(r => r.id));
-            const created = now.find((r: Rule) => !known.has(r.id) && looksLikeCreated(r, { method, path, statusCode, priority: priority ?? 0, body: body || '' }));
-            const payload = toToolError(e, { tool: 'add_mock_rule', intendedChange: intended, apiKey: cfg.apiKey });
-            payload.error.details = created
-              ? { reconciled: 'applied', ruleId: created.id, note: 'The write DID succeed. Do not add it again.' }
-              : { reconciled: 'not_found', note: 'No matching new rule exists after re-reading. It is now safe to retry once.' };
-            return errorResult(payload);
+            const after = (await client.getMockEndpoint(endpointId)).endpoint?.rules ?? [];
+            payload.error.details = {
+              outcome: 'unknown',
+              reconciliation: 'read_ok',
+              candidates: candidatesAfterAdd(before, after, wanted),
+              note: 'Candidates are NOT proof that your write applied: a concurrent writer can create a look-alike, and your request may still commit after this read. Do not retry add_mock_rule on this evidence. Re-read with get_mock_endpoint after a pause and decide with the user.',
+            };
           } catch {
-            return fail(e, 'add_mock_rule', intended);
+            payload.error.details = { outcome: 'unknown', reconciliation: 'read_failed', candidates: [], note: 'The follow-up read also failed, so there is no evidence either way. Do not retry add_mock_rule until get_mock_endpoint works and you have compared the rules.' };
           }
+          return errorResult(payload, cfg.apiKey);
         }
         return fail(e, 'add_mock_rule', intended);
       }
@@ -183,7 +215,7 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
   // ── update_mock_rule ──
   server.tool(
     'update_mock_rule',
-    'Edit an EXISTING rule (including the Free starter) in place. WRITE: saved but NOT deployed — call deploy_mock to publish. Requires `expectedUpdatedAt` = the `updatedAt` from your latest get_mock_endpoint; the server applies the change atomically only if nothing changed since, otherwise you get code `conflict` with the current state and your intended change — nothing is overwritten and nothing is retried. Only the fields you pass change: match.method/path, response.statusCode/headers/body, priority (LOWER = evaluated first), isActive. `sequence`: omit = keep the existing Sequence; null = clear it (back to a static response); object = replace it. While a rule has a Sequence its static response is ignored — pass sequence:null to make it static. Safe to repeat after a lost response: the repeated call returns conflict if the first one was applied (the token moved).',
+    'Edit an EXISTING rule (including the Free starter) in place. WRITE: saved but NOT deployed — call deploy_mock to publish. Requires `expectedUpdatedAt` = the `updatedAt` from your latest get_mock_endpoint; the server applies the change atomically only if nothing changed since, otherwise you get code `conflict` with the current state and your intended change — nothing is overwritten and nothing is retried. Only the fields you pass change: match.method/path, response.statusCode/headers/body, priority (LOWER = evaluated first), isActive. `sequence`: omit = keep the existing Sequence; null = clear it (back to a static response); object = replace it. While a rule has a Sequence its static response is ignored — pass sequence:null to make it static. The server must state atomic compare-and-set support (otherwise the call is refused before sending); a `sequence` field also requires stated Scenario support. If a response is lost, the outcome is UNKNOWN: call get_mock_endpoint before any repeat (repeating with the old token returns conflict if the first call applied, unless another writer also moved the token).',
     {
       endpointId: z.string(),
       ruleId: z.string().describe('Rule id from get_mock_endpoint (the starter rule has one too)'),
@@ -201,10 +233,25 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
         return errorResult(toToolError(new ApiError('No fields to change', 400, { error: 'Pass at least one of match, response, priority, isActive, sequence.' }), { tool: 'update_mock_rule', intendedChange: intended, apiKey: cfg.apiKey }));
       }
       let currentEp: any;
+      let caps: ServerCapabilities;
       try {
-        currentEp = (await client.getMockEndpoint(endpointId)).endpoint;
+        const pre = await client.getMockEndpoint(endpointId);
+        currentEp = pre.endpoint;
+        caps = parseCapabilities(pre.capabilities);
       } catch (e) {
         return fail(e, 'update_mock_rule', intended);
+      }
+      // Fail closed: an old server answers 200 while ignoring expectedUpdatedAt and sequence. Only an explicit statement from the server counts.
+      if (!(caps.status === 'ok' && caps.atomicCas)) {
+        return capabilityRefusal(caps, 'atomic compare-and-set rule updates', intended);
+      }
+      if (patch.sequence !== undefined) {
+        if (!caps.scenarioSupported) {
+          return capabilityRefusal(caps, 'Scenario sequences', intended);
+        }
+        if (patch.sequence !== null && !caps.scenarioEnabled) {
+          return scenarioRefusal(caps, intended);
+        }
       }
       const current: Rule | undefined = (currentEp.rules ?? []).find((r: Rule) => r.id === ruleId);
       if (!current) {
@@ -217,15 +264,16 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
       try {
         const result = await client.updateMockRule(endpointId, ruleId, buildPatchPayload(current, patch, expectedUpdatedAt));
         const ep = result.endpoint;
-        const warnings = ruleWarnings(ep?.rules ?? []);
+        requireShape(typeof result.rule?.id === 'string' && Array.isArray(ep?.rules) && typeof ep?.updatedAt === 'string', 'rule.id / endpoint.rules / endpoint.updatedAt');
+        const warnings = ruleWarnings(ep.rules);
         if (current.sequence?.steps?.length && patch.response && patch.sequence === undefined) {
           warnings.push('This rule still has a Sequence, so the static response you just saved is ignored while the Sequence exists. Pass sequence:null to serve the static response.');
         }
         return ok({
-          rule: result.rule ? summarizeRule(result.rule) : null,
+          rule: summarizeRule(result.rule),
           /** New token for the next update. */
-          updatedAt: ep?.updatedAt,
-          state: ep ? publishState({ publishedAt: ep.publishedAt, configVersion: ep.configVersion, rules: ep.rules ?? [], publishedRules: ep.publishedRules, publishIsolation: ep.publishIsolation }) : null,
+          updatedAt: ep.updatedAt,
+          state: publishState({ publishedAt: ep.publishedAt, configVersion: ep.configVersion, rules: ep.rules, publishedRules: ep.publishedRules, publishIsolation: ep.publishIsolation }),
           warnings,
           deployed: false,
           message: 'Saved, NOT deployed. The live URL may still serve the previous deploy (see state). Call deploy_mock to publish.',
@@ -239,19 +287,28 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
   // ── reset_mock_sequence ──
   server.tool(
     'reset_mock_sequence',
-    'Ask the live mock server to restart ONE rule\'s Sequence at step 1. WRITE-like, affects every caller of the published endpoint, never changes saved rules. HTTP 202 means QUEUED, not that the data plane has applied it: verify by sending a request and reading list_mock_captures (the capture shows run/step). It acts on the PUBLISHED Sequence only — unpublished edits take effect after deploy_mock. If the server has the Scenario runtime disabled you get scenario_runtime_unavailable (a capability gap; this tool never enables flags). Safe to repeat.',
+    'Ask the live mock server to restart ONE rule\'s Sequence at step 1. It affects EVERY caller of the published endpoint (including other people\'s tests) and never changes saved rules. HTTP 202 means QUEUED, not that the data plane has applied it: verify by sending a request and reading list_mock_captures (the capture shows run/step). It acts on the PUBLISHED Sequence only — unpublished edits take effect after deploy_mock. Requires a server that states Scenario support and has it enabled; otherwise the call is refused before sending (this tool never enables flags). It is NOT idempotent or side-effect-free: every call restarts the Sequence again, so after a lost response check get_mock_endpoint / list_mock_captures before repeating.',
     { endpointId: z.string(), ruleId: z.string() },
     async ({ endpointId, ruleId }) => {
+      const intended = { endpointId, ruleId };
       try {
+        const caps = parseCapabilities((await client.getMockEndpoint(endpointId)).capabilities);
+        if (!caps.scenarioSupported) {
+          return capabilityRefusal(caps, 'Scenario sequence reset', intended);
+        }
+        if (!caps.scenarioEnabled) {
+          return scenarioRefusal(caps, intended);
+        }
         const result = await client.resetMockSequence(endpointId, ruleId);
+        requireShape(result?.published === true, 'published:true');
         return ok({
-          queued: Boolean(result.published),
+          queued: true,
           observedApplied: false,
           note: 'Reset is QUEUED on the data plane; it is not proof of completion. Send a request and check list_mock_captures for the step it received.',
           serverNote: result.note,
         });
       } catch (e) {
-        return fail(e, 'reset_mock_sequence', { endpointId, ruleId });
+        return fail(e, 'reset_mock_sequence', intended);
       }
     },
   );
@@ -259,12 +316,13 @@ export function registerMockTools(server: McpServer, client: RequestBinClient, c
   // ── deploy_mock ──
   server.tool(
     'deploy_mock',
-    'Publish the CURRENTLY SAVED rules to the live mock server. The only tool that deploys; add/update never do. WRITE: bumps configVersion. Deploys saved rules only — an edit you have not saved is not included. Safe to repeat (it just bumps the version again). "Deployed" is not a passing test: verify by calling the URL and reading list_mock_captures.',
+    'Publish the CURRENTLY SAVED rules to the live mock server. The only tool that deploys; add/update never do. WRITE: bumps configVersion. Deploys saved rules only — an edit you have not saved is not included. Repeating it is NOT side-effect-free: every call publishes whatever is saved at that moment, including edits saved meanwhile by you or other callers, and bumps the version. After a lost response the outcome is UNKNOWN — check get_mock_endpoint (configVersion, publishedAt, state) before repeating. "Deployed" is not a passing test: verify by calling the URL and reading list_mock_captures.',
     { endpointId: z.string() },
     async ({ endpointId }) => {
       try {
         const result = await client.deployMockEndpoint(endpointId);
         const ep = result.endpoint;
+        requireShape(typeof ep?.configVersion === 'number' && Array.isArray(ep?.rules), 'endpoint.configVersion / endpoint.rules');
         return ok({
           ...view(ep),
           message: `Deployed config v${ep?.configVersion}. Next: send a real request to ${ep?.slug ? urlFor(ep.slug) : 'the URL'} and confirm it with list_mock_captures — deploying is not verification.`,

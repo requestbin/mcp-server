@@ -113,10 +113,10 @@ Add to `~/.windsurf/mcp_config.json`:
 | `list_mock_endpoints` | read | Endpoints with slug, URL, rule count, last deploy |
 | `get_mock_endpoint` | read | One endpoint: rules **in match order** with ids, the `updatedAt` token, saved / deployed / legacy state, warnings (unreachable rules, unsupported path syntax) |
 | `create_mock_endpoint` | write | New endpoint (counts toward your endpoint cap), born with **one starter rule** (`* *` → 200) |
-| `update_mock_rule` | write (saved, **not deployed**) | Edit an **existing** rule — including the Free starter — with atomic `expectedUpdatedAt` compare-and-set. Static response and Sequence (`sequence` omitted = keep, `null` = clear) |
+| `update_mock_rule` | write (saved, **not deployed**) | Edit an **existing** rule — including the Free starter — with atomic `expectedUpdatedAt` compare-and-set. Static response and Sequence (`sequence` omitted = keep, `null` = clear). **Refused before sending unless the server states it enforces atomic CAS** (see Compatibility) |
 | `add_mock_rule` | write (saved, not deployed) | Append a rule (PRO/TEAM headroom; Free is rejected as `plan_limit`) |
-| `reset_mock_sequence` | write-like | Ask the live server to restart one rule's Sequence at step 1 (HTTP 202 = **queued**, not observed) |
-| `deploy_mock` | write | **The only tool that publishes.** Deploys the saved rules; safe to repeat |
+| `reset_mock_sequence` | write-like | Ask the live server to restart one rule's Sequence at step 1 for **every caller** (HTTP 202 = **queued**, not observed). Not idempotent: each call restarts it again |
+| `deploy_mock` | write | **The only tool that publishes.** Deploys the saved rules. Not side-effect-free to repeat: each call publishes whatever is saved at that moment, including others' intervening edits |
 | `list_mock_captures` | read | Requests that reached the endpoint: status returned, matched rule id, and Sequence run/step/outcome when recorded |
 
 ### What the mock server really matches (read this before writing rules)
@@ -146,10 +146,19 @@ Every failure is returned as `{"error": {"code", "status", "message", "hint", ..
 | `scenario_runtime_unavailable` | server has Sequence/Reset disabled | capability gap; tools never enable flags |
 | `not_found` | unknown endpoint/rule **or another account's** | list again |
 | `unauthorized` | bad key | key is never echoed |
-| `network_error` | request never reached the server | no state changed; safe to retry |
-| `ambiguous_write` | connection lost or 5xx **after** a write may have applied | do **not** repeat blindly; `add_mock_rule` re-reads once and tells you whether the rule exists (`details.reconciled`) |
+| `network_error` | a refused connection (nothing sent) or a failed read | this call changed nothing; retrying is allowed |
+| `ambiguous_write` | connection lost, timeout, unreadable/truncated response or 5xx **after** a write may have applied | outcome is **UNKNOWN**. Never auto-retried. `add_mock_rule` re-reads once and lists **candidate** rules (`details.candidates`, each with `matchesIntendedExactly`) — candidates are **not proof** (a concurrent writer can create a look-alike, and the original request may still commit). Compare with `get_mock_endpoint` and decide with the user |
+| `capability_unavailable` | the server did not state the capability this write needs | refused **before sending**; nothing changed |
 
 Saved edits are **not** live until `deploy_mock`. On endpoints deployed before deploy-time snapshots existed (`state.kind: "legacy"`) the server cannot prove saved edits are isolated from the live URL, so the tools never claim they are.
+
+### Compatibility (read before pointing this at a server)
+
+The edit tools rely on server behaviour that older RequestBin builds do **not** have: atomic `expectedUpdatedAt` compare-and-set on `PATCH …/rules/:ruleId`, and the `sequence` field / `…/reset` route. An older server answers `200` to those calls while **silently ignoring** the token and the sequence, so the tools never infer support. The only accepted evidence is the explicit `capabilities` object that `GET /api/mock-endpoints/:id` returns from a build that implements it (contract `mock-rules-v1`: `ruleUpdate.atomicCas`, `scenario.supported`, `scenario.enabled`; SaaS `src/libs/mock/capabilities.ts`). Absent or malformed → capability-dependent writes (`update_mock_rule`, `add_mock_rule` with a `sequence`, `reset_mock_sequence`) are refused with `capability_unavailable`; read-only tools and a plain `add_mock_rule` keep working. `get_mock_endpoint` shows `serverCapabilities`. This depends on the SaaS capability-contract PR (stacked on requestbin#313) and, for Sequences, on a server with Scenario enabled; neither is merged or published.
+
+### What is and is not redacted
+
+Output is scrubbed of **the API key this server was started with** (strings, nested objects/arrays, keys; including `intendedChange`, `current`, `details` and successful summaries). It is output-only: rules you write are stored exactly as sent. It does **not** claim that captured requests or rule content are free of other secrets.
 
 ## Quickstart (about 5 minutes)
 
@@ -209,6 +218,7 @@ The agent will:
 | `REQUESTBIN_BASE_URL` | No | `https://requestbin.net` | Custom API base URL (for self-hosted instances) |
 | `REQUESTBIN_MOCK_DOMAIN` | No | `rbmock.dev` | Domain that hosts mock endpoints (override for self-hosted) |
 | `REQUESTBIN_MOCK_SCHEME` | No | `https` | Use `http` for a local data plane |
+| `REQUESTBIN_TIMEOUT_MS` | No | `30000` | Bound for every API call. An aborted **write** is reported as outcome UNKNOWN, never as "not sent" |
 
 ## Requirements
 

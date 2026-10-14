@@ -4,7 +4,18 @@
  * MCP layer can be tested through the real MCP protocol client. It is not evidence about the real server — the
  * live demo (docs/demo) is.
  */
-export type Opts = { plan?: 'free' | 'pro'; scenario?: boolean; failNext?: Array<{ match: RegExp; mode: 'network-before' | 'network-after' | '500-after' }> };
+export type FailMode = 'network-before' | 'network-after' | '500-after' | 'body-stream-fail' | 'truncated-json' | 'non-json-200' | 'delay-commit' | 'hang';
+export type CapsMode = 'full' | 'absent' | 'malformed' | 'cas-only-no-scenario' | 'scenario-disabled';
+export type Opts = {
+  plan?: 'free' | 'pro';
+  /** Server-side Scenario flag (what the real server's ENABLE_MOCK_SCENARIO does). */
+  scenario?: boolean;
+  /** What GET /api/mock-endpoints/:id says about capabilities. Default 'full'. */
+  caps?: CapsMode;
+  /** OLD server: PATCH/POST silently ignore `expectedUpdatedAt` and `sequence` and answer 200 (the real master behaviour). */
+  legacy?: boolean;
+  failNext?: Array<{ match: RegExp; mode: FailMode }>;
+};
 
 let counter = 0;
 
@@ -15,6 +26,9 @@ export function createFakeSaas(opts: Opts = {}) {
     ep: null as any,
     calls: [] as Array<{ method: string; path: string; body?: any }>,
     scenario: opts.scenario ?? true,
+    pending: [] as Array<() => void>,
+    /** Runs right after a faulted write was applied (models a concurrent writer acting in the same window). */
+    afterWrite: undefined as undefined | (() => void),
     failNext: [...(opts.failNext ?? [])],
     clock: 1000,
   };
@@ -45,12 +59,31 @@ export function createFakeSaas(opts: Opts = {}) {
       if (fail.mode === 'network-before') {
         throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
       }
-      // apply first, then lose the response (the dangerous case)
+      if (fail.mode === 'hang') {
+        return new Promise<Response>((_, reject) => {
+          init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+        });
+      }
+      if (fail.mode === 'delay-commit') {
+        // The server accepted the request but commits LATER; the client sees a lost connection now.
+        state.pending.push(() => { void handle(method, path, body); });
+        throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+      }
+      // apply first, then lose/garble the response (the dangerous cases)
       const res = await handle(method, path, body);
+      state.afterWrite?.();
       if (fail.mode === 'network-after') {
         throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
       }
-      void res;
+      if (fail.mode === 'body-stream-fail') {
+        return { ok: true, status: 200, statusText: 'OK', text: async () => { throw Object.assign(new TypeError('terminated'), { cause: { code: 'UND_ERR_SOCKET' } }); } } as unknown as Response;
+      }
+      if (fail.mode === 'truncated-json') {
+        return new Response((await res.text()).slice(0, 25), { status: res.status });
+      }
+      if (fail.mode === 'non-json-200') {
+        return new Response('<html>gateway ok</html>', { status: 200 });
+      }
       return json(500, { error: 'Internal server error' });
     }
     return handle(method, path, body);
@@ -59,7 +92,18 @@ export function createFakeSaas(opts: Opts = {}) {
   async function handle(method: string, path: string, body: any): Promise<Response> {
     let m: RegExpMatchArray | null;
     if (method === 'GET' && (m = path.match(/^\/api\/mock-endpoints\/([^/]+)$/))) {
-      return m[1] === state.ep.id ? json(200, { endpoint: state.ep }) : json(404, { error: 'Endpoint not found' });
+      if (m[1] !== state.ep.id) {
+        return json(404, { error: 'Endpoint not found' });
+      }
+      const mode = opts.caps ?? 'full';
+      const capabilities = mode === 'absent'
+        ? undefined
+        : mode === 'malformed'
+          ? { apiContract: 'mock-rules-v1', ruleUpdate: { atomicCas: 'yes' } }
+          : mode === 'cas-only-no-scenario'
+            ? { apiContract: 'mock-rules-v1', ruleUpdate: { atomicCas: true } }
+            : { apiContract: 'mock-rules-v1', ruleUpdate: { atomicCas: true }, scenario: { supported: true, enabled: mode === 'scenario-disabled' ? false : state.scenario } };
+      return json(200, { endpoint: state.ep, ...(capabilities ? { capabilities } : {}) });
     }
     if (method === 'POST' && (m = path.match(/^\/api\/mock-endpoints\/([^/]+)\/rules$/))) {
       if (m[1] !== state.ep.id) {
@@ -67,6 +111,9 @@ export function createFakeSaas(opts: Opts = {}) {
       }
       if (state.ep.rules.length >= cap) {
         return json(403, { allowed: false, error: `You've reached the ${cap} mock rule limit on your ${plan} plan.`, currentPlan: plan, requiredPlan: plan === 'free' ? 'pro' : 'team', usage: { current: state.ep.rules.length, max: cap } });
+      }
+      if (opts.legacy) {
+        delete body.sequence;
       }
       if (body.sequence && !state.scenario) {
         return json(422, { error: 'Validation failed', issues: { sequence: 'Scenario sequences are not enabled' } });
@@ -79,6 +126,10 @@ export function createFakeSaas(opts: Opts = {}) {
     if (method === 'PATCH' && (m = path.match(/^\/api\/mock-endpoints\/([^/]+)\/rules\/([^/]+)$/))) {
       const rule = state.ep.rules.find((r: any) => r.id === m![2]);
       const conflict = () => json(409, { error: 'This rule changed since you opened the comparison.', code: 'rule_conflict', rule: rule ?? null, endpoint: state.ep });
+      if (opts.legacy) {
+        delete body.expectedUpdatedAt;
+        delete body.sequence;
+      }
       if (body.expectedUpdatedAt && body.expectedUpdatedAt !== state.ep.updatedAt) {
         return conflict();
       }
@@ -137,5 +188,5 @@ export function createFakeSaas(opts: Opts = {}) {
     return json(404, { error: 'Not found' });
   }
 
-  return { fetchImpl, state, createEndpoint };
+  return { fetchImpl, state, createEndpoint, /** run commits that were accepted but delayed */ flush: () => { state.pending.splice(0).forEach(f => f()); } };
 }

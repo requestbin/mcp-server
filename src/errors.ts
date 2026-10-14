@@ -15,21 +15,25 @@ export type ErrorCode =
   | 'network_error'
   | 'ambiguous_write'
   | 'server_error'
-  | 'bad_request';
+  | 'bad_request'
+  | 'capability_unavailable';
 
 /** Thrown by RequestBinClient for every non-2xx response and for network failures (status 0). */
 export class ApiError extends Error {
   status: number;
   body: any;
-  /** True when the request may have reached the server (network loss after send, 5xx): a write's outcome is unknown. */
+  /** True when the request may have reached the server (network loss after send, timeout, unreadable response, 5xx): a write's outcome is unknown. */
   mayHaveApplied: boolean;
+  /** Why a status-0 failure happened: `refused` (never connected), `timeout`, `transport` (lost mid-flight), `unreadable` (response body/shape unusable). */
+  kind?: 'refused' | 'timeout' | 'transport' | 'unreadable';
 
-  constructor(message: string, status: number, body: any, mayHaveApplied = false) {
+  constructor(message: string, status: number, body: any, mayHaveApplied = false, kind?: ApiError['kind']) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.body = body;
     this.mayHaveApplied = mayHaveApplied;
+    this.kind = kind;
   }
 }
 
@@ -63,12 +67,57 @@ export function redact(text: string, apiKey?: string): string {
   return out;
 }
 
+/**
+ * Replace the CONFIGURED credential everywhere in a value we are about to return (strings, nested arrays/objects, keys).
+ * Scope: only the key this server was started with. It does not (and cannot) promise that arbitrary captured or
+ * user-supplied content is free of other secrets. It never changes what was written to a rule — output only.
+ */
+export function redactDeep<T>(value: T, apiKey?: string): T {
+  if (!apiKey || apiKey.length < 8) {
+    return value;
+  }
+  const scrub = (s: string) => s.split(apiKey).join('rb_***');
+  const walk = (v: any): any => {
+    if (typeof v === 'string') {
+      return scrub(v);
+    }
+    if (Array.isArray(v)) {
+      return v.map(walk);
+    }
+    if (v && typeof v === 'object') {
+      return Object.fromEntries(Object.entries(v).map(([k, x]) => [scrub(k), walk(x)]));
+    }
+    return v;
+  };
+  return walk(value);
+}
+
+/** Serialize a tool payload with the configured credential removed at the output boundary. */
+export function serializeSafe(payload: unknown, apiKey?: string): string {
+  return redactDeep(JSON.stringify(redactDeep(payload, apiKey), null, 2), apiKey);
+}
+
 export type ErrorContext = {
   tool: string;
   /** Present for writes so ambiguous/conflict errors can echo the intended change. */
   intendedChange?: unknown;
   apiKey?: string;
 };
+
+/** Outcome-UNKNOWN guidance, specific to what repeating each tool would do. Never claims a repeat is safe. */
+function retryHint(tool: string): string {
+  const base = 'The outcome is UNKNOWN: do NOT repeat the write on a guess. Call get_mock_endpoint (and list_mock_captures if relevant) and compare with what you intended.';
+  if (tool === 'deploy_mock') {
+    return `${base} Repeating deploy_mock publishes whatever is saved at that moment, including edits saved meanwhile by you or other callers.`;
+  }
+  if (tool === 'reset_mock_sequence') {
+    return `${base} Every reset restarts the Sequence again for every caller of the published endpoint.`;
+  }
+  if (tool === 'add_mock_rule') {
+    return `${base} A repeated add can create a duplicate rule if the first request commits late.`;
+  }
+  return base;
+}
 
 export function toToolError(err: unknown, ctx: ErrorContext): ToolErrorPayload {
   const base = (code: ErrorCode, status: number, message: string, hint: string, extra: Partial<ToolErrorPayload['error']> = {}): ToolErrorPayload => ({
@@ -90,15 +139,25 @@ export function toToolError(err: unknown, ctx: ErrorContext): ToolErrorPayload {
   const serverMessage = typeof body.error === 'string' ? body.error : err.message;
 
   if (err.status === 0) {
+    const reason = err.kind === 'timeout' ? 'the request timed out' : err.kind === 'unreadable' ? 'the response could not be read or was not in the expected shape' : 'the connection failed';
+    if (err.mayHaveApplied) {
+      return base(
+        'ambiguous_write',
+        0,
+        `The write's outcome is UNKNOWN: ${reason} (${serverMessage}). The request may have reached the server and may still commit.`,
+        retryHint(ctx.tool),
+      );
+    }
+    if (err.kind === 'unreadable') {
+      return base('server_error', 0, `The server answered but the response was unusable (${serverMessage}). This call changed nothing.`, 'Retry the read later; check REQUESTBIN_BASE_URL points at the RequestBin API.');
+    }
     return base(
-      err.mayHaveApplied ? 'ambiguous_write' : 'network_error',
+      'network_error',
       0,
-      err.mayHaveApplied
-        ? `The connection failed after the request may have been sent (${serverMessage}). Whether the change was applied is UNKNOWN.`
-        : `Could not reach the RequestBin API (${serverMessage}). Nothing was sent.`,
-      err.mayHaveApplied
-        ? 'Do NOT repeat the write blindly. Call get_mock_endpoint and compare the rules (and updatedAt) with what you intended, then act on what you actually see.'
-        : 'Check REQUESTBIN_BASE_URL and that the API is reachable, then retry. No state changed.',
+      err.kind === 'refused'
+        ? `Could not reach the RequestBin API (${serverMessage}). Nothing was sent.`
+        : `The read failed (${serverMessage}). This call changed nothing.`,
+      'Check REQUESTBIN_BASE_URL and that the API is reachable, then retry. No state changed.',
     );
   }
   if (err.status === 401) {
@@ -162,14 +221,19 @@ export function toToolError(err: unknown, ctx: ErrorContext): ToolErrorPayload {
     return base(
       err.mayHaveApplied ? 'ambiguous_write' : 'server_error',
       err.status,
-      `The server failed (${err.status}). The outcome of a write is UNKNOWN.`,
-      'Do NOT repeat a write blindly. Call get_mock_endpoint to see what actually changed.',
+      err.mayHaveApplied ? `The server failed (${err.status}). The write's outcome is UNKNOWN.` : `The server failed (${err.status}). This call changed nothing.`,
+      err.mayHaveApplied ? retryHint(ctx.tool) : 'Retry the read later.',
     );
   }
 
   return base('server_error', err.status, clip(serverMessage), 'Unexpected response. Re-read state before retrying.');
 }
 
-export function errorResult(payload: ToolErrorPayload) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }], isError: true };
+export function errorResult(payload: ToolErrorPayload, apiKey?: string) {
+  return { content: [{ type: 'text' as const, text: serializeSafe(payload, apiKey) }], isError: true };
+}
+
+/** Build a tool error that is raised by the tool itself (preflight refusals), not by an HTTP response. */
+export function toolRefusal(code: ErrorCode, message: string, hint: string, extra: Partial<ToolErrorPayload['error']> = {}): ToolErrorPayload {
+  return { error: { code, status: 0, message, hint, ...extra } };
 }

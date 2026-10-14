@@ -7,26 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { RequestBinClient } from '../src/api-client.js';
 import { registerMockTools } from '../src/mock-tools.js';
-import type { Opts } from './fake-saas.js';
-import { createFakeSaas } from './fake-saas.js';
-
-const KEY = 'rb_test_super_secret_key_123456';
-
-/** Real MCP protocol (client <-> server over an in-memory transport); only the HTTP layer is faked. */
-async function setup(opts: Opts = {}) {
-  const fake = createFakeSaas(opts);
-  const server = new McpServer({ name: 'requestbin-test', version: '0.0.0' });
-  registerMockTools(server, new RequestBinClient(KEY, 'http://api.test', fake.fetchImpl), { apiKey: KEY, mockDomain: 'localhost:8081', mockScheme: 'http' });
-  const [ct, st] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: 'test-client', version: '0.0.0' });
-  await Promise.all([server.connect(st), client.connect(ct)]);
-  const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const res: any = await client.callTool({ name, arguments: args });
-    const text = res.content?.[0]?.text ?? '';
-    return { isError: Boolean(res.isError), text, json: JSON.parse(text) };
-  };
-  return { fake, client, call };
-}
+import { KEY, setup } from './harness.js';
 
 test('tool list is the closure contract and no description advertises globs or higher-priority-first', async () => {
   const { client } = await setup();
@@ -155,12 +136,15 @@ test('priority: the Free catch-all starter shadows a new specific rule at priori
   assert.equal(g.json.rulesInMatchOrder.at(-1).match.path, '/checkout');
 });
 
-test('network loss: before send = network_error (safe retry); after an applied write = ambiguous_write reconciled as applied, never a duplicate', async () => {
+test('network loss: before send = network_error (nothing sent); after an applied write = ambiguous_write with UNKNOWN outcome and candidates only — never a verdict', async () => {
   const { call, fake } = await setup({ plan: 'pro', failNext: [{ match: /POST .*\/rules$/, mode: 'network-after' }] });
   const r = await call('add_mock_rule', { endpointId: 'ep1', method: 'GET', path: '/x', statusCode: 201, priority: -5 });
   assert.equal(r.isError, true);
   assert.equal(r.json.error.code, 'ambiguous_write');
-  assert.equal(r.json.error.details.reconciled, 'applied');
+  assert.equal(r.json.error.details.outcome, 'unknown');
+  assert.equal(r.json.error.details.candidates.length, 1);
+  assert.equal(r.json.error.details.candidates[0].matchesIntendedExactly, true);
+  assert.ok(!/DID succeed|safe to retry/i.test(r.text));
   assert.equal(fake.state.ep.rules.length, 2);
   assert.equal(fake.state.calls.filter(c => c.method === 'POST' && c.path.endsWith('/rules')).length, 1, 'exactly one write attempt');
 

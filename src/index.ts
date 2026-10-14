@@ -34,7 +34,8 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-const client = new RequestBinClient(API_KEY, BASE_URL);
+// REQUESTBIN_TIMEOUT_MS bounds every API call (default 30000). An aborted write is reported as UNKNOWN, never as "not sent".
+const client = new RequestBinClient(API_KEY, BASE_URL, fetch, { timeoutMs: Number(process.env.REQUESTBIN_TIMEOUT_MS) || undefined });
 const server = new McpServer({
   name: 'requestbin',
   version: '0.1.0',

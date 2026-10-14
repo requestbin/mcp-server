@@ -172,9 +172,45 @@ const scenarios = {
     const amb = await connect('RB_KEY_PRO', { FAULT: 'lose-response:POST:/rules', NODE_OPTIONS: `--import ${path.join(here, 'fault-preload.mjs')}` });
     const r = await amb.call('add_mock_rule', { endpointId: pc.id, method: 'GET', path: '/once', statusCode: 201, priority: -1 });
     const chk = (await amb.call('get_mock_endpoint', { endpointId: pc.id })).json;
-    log('check', { ambiguousCode: r.json.error?.code, reconciled: r.json.error?.details?.reconciled, rulesAfter: chk.rulesInMatchOrder.length, duplicates: chk.rulesInMatchOrder.filter(x => x.match.path === '/once').length });
+    log('check', { ambiguousCode: r.json.error?.code, outcome: r.json.error?.details?.outcome, candidates: r.json.error?.details?.candidates, claimsAppliedOrSafeRetry: /DID succeed|safe to retry/i.test(JSON.stringify(r.json)), rulesAfter: chk.rulesInMatchOrder.length, duplicates: chk.rulesInMatchOrder.filter(x => x.match.path === '/once').length });
     await amb.close();
   },
+};
+
+/** Server WITHOUT the capability contract (an older build): reads work, capability-dependent writes are refused before sending. */
+scenarios.compat = async () => {
+  const m = await connect('RB_KEY_FREE');
+  const created = (await m.call('create_mock_endpoint', { name: 'cx-demo-compat' })).json;
+  const { id } = created; const starter = created.rulesInMatchOrder[0].id;
+  const g = (await m.call('get_mock_endpoint', { endpointId: id })).json;
+  log('check', { capabilitiesStatus: g.serverCapabilities?.status, readOnlyWorks: Boolean(g.rulesInMatchOrder) });
+  // another writer (UI/API) changes the rule; an old server would let our stale PATCH overwrite it
+  const other = await connect('RB_KEY_FREE');
+  const og = (await other.call('get_mock_endpoint', { endpointId: id })).json;
+  // the ONLY way to change it on an old server is outside these tools: use the raw API as the "other writer"
+  const res = await fetch(`${BASE}/api/mock-endpoints/${id}/rules/${starter}`, { method: 'PATCH', headers: { Authorization: `Bearer ${keys.RB_KEY_FREE}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ response: { statusCode: 201, headers: {}, body: 'other-writer' } }) });
+  log('other-writer', { status: res.status });
+  const r = await m.call('update_mock_rule', { endpointId: id, ruleId: starter, expectedUpdatedAt: g.updatedAt, response: { statusCode: 500, body: 'ours' } });
+  const after = (await m.call('get_mock_endpoint', { endpointId: id })).json;
+  log('check', { refusedCode: r.json.error?.code, statusAfter: after.rulesInMatchOrder[0].response.statusCode, bodyAfter: after.rulesInMatchOrder[0].response.bodyPreview, otherWriterKept: after.rulesInMatchOrder[0].response.bodyPreview === 'other-writer' });
+  const rs = await m.call('reset_mock_sequence', { endpointId: id, ruleId: starter });
+  log('check', { resetCode: rs.json.error?.code });
+  await other.close(); await m.close();
+};
+
+/** The configured (synthetic, task-owned) key placed inside rule content: output is redacted, the stored rule is untouched. */
+scenarios.redact = async () => {
+  const key = keys.RB_KEY_PRO;
+  const m = await connect('RB_KEY_PRO');
+  const created = (await m.call('create_mock_endpoint', { name: 'cx-demo-redact' })).json;
+  const { id } = created;
+  const add = await m.call('add_mock_rule', { endpointId: id, method: 'POST', path: '/leak', statusCode: 200, priority: -1, body: JSON.stringify({ token: key, note: 'keep-me' }), headers: { Authorization: `Bearer ${key}`, 'X-Note': 'keep-me' } });
+  const get = await m.call('get_mock_endpoint', { endpointId: id });
+  const raw = await (await fetch(`${BASE}/api/mock-endpoints/${id}`, { headers: { Authorization: `Bearer ${key}` } })).json();
+  const stored = raw.endpoint.rules.find(r => r.match.path === '/leak');
+  const outputs = JSON.stringify([add, get]);
+  log('check', { toolOutputsContainKey: outputs.includes(key), diagnosticsKept: outputs.includes('keep-me'), storedHeaderUnchanged: stored.response.headers.Authorization === `Bearer ${key}`, storedBodyUnchanged: stored.response.body.includes(key) });
+  await m.close();
 };
 
 scenarios.verify = async () => {
