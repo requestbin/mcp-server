@@ -1,7 +1,7 @@
 {
   "name": "@requestbin/mcp-server",
-  "version": "0.3.0",
-  "description": "MCP server for RequestBin — test webhooks from Claude Code, Cursor, and Windsurf",
+  "version": "0.4.0",
+  "description": "MCP server for RequestBin \u2014 test webhooks from Claude Code, Cursor, and Windsurf",
   "license": "MIT",
   "homepage": "https://github.com/requestbin/mcp-server",
   "repository": {
@@ -28,7 +28,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
